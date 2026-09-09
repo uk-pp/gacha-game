@@ -14,11 +14,7 @@ const ITEMS = [
 ];
 
 app.use(express.json());
-
-/* Renderのプロキシ越しでもIPを取得 */
 app.set("trust proxy", 1);
-
-/* GitHubではファイルを全部ルートに置いている */
 app.use(express.static(__dirname));
 
 function getIp(req) {
@@ -61,20 +57,13 @@ function drawItem() {
   return ITEMS[ITEMS.length - 1];
 }
 
-/* プレイヤー取得 */
 async function getPlayer(ip) {
   const rows = await supabaseRequest(
     `gacha_players?ip=eq.${encodeURIComponent(ip)}&limit=1`
   );
 
   if (rows.length > 0) {
-    const player = rows[0];
-
-    if (!player.rate_counts) player.rate_counts = {};
-    if (typeof player.total !== "number") player.total = 0;
-    if (typeof player.completed !== "boolean") player.completed = false;
-
-    return player;
+    return rows[0];
   }
 
   const newPlayer = {
@@ -92,89 +81,86 @@ async function getPlayer(ip) {
   return created[0];
 }
 
-/* 現在の状態 */
 app.get("/api/status", async (req, res) => {
   try {
     const player = await getPlayer(getIp(req));
 
     res.json({
       totalDraws: player.total,
-      rateCounts: player.rate_counts,
+      rateCounts: player.rate_counts || {},
       completed: player.completed
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "データ取得に失敗しました" });
+    res.status(500).json({
+      error: "データ取得に失敗しました"
+    });
   }
 });
 
-/* ガチャ */
 app.post("/api/draw", async (req, res) => {
   try {
     const ip = getIp(req);
+
+    /*
+      DB側の関数で「1回引く＝必ず1回加算」を行う。
+      同時に複数回リクエストされても累計が戻らない。
+    */
+
     const player = await getPlayer(ip);
 
-    /* 0.0001%達成後はもう引けない */
     if (player.completed) {
       return res.json({
         completed: true,
         totalDraws: player.total,
-        rateCounts: player.rate_counts
+        rateCounts: player.rate_counts || {}
       });
     }
 
     const item = drawItem();
-
-    const newTotal = player.total + 1;
-
-    const rateCounts = {
-      ...(player.rate_counts || {})
-    };
-
     const key = String(item.rate);
-    rateCounts[key] = (rateCounts[key] || 0) + 1;
-
     const completed = item.target === true;
 
-    /* プレイヤー情報を更新 */
-    await supabaseRequest(
-      `gacha_players?ip=eq.${encodeURIComponent(ip)}`,
+    const result = await supabaseRequest(
+      "rpc/increment_gacha_player",
       {
-        method: "PATCH",
+        method: "POST",
         body: JSON.stringify({
-          total: newTotal,
-          rate_counts: rateCounts,
-          completed
+          p_ip: ip,
+          p_rate: key,
+          p_completed: completed
         })
       }
     );
 
-    /* 0.0001%達成者を記録 */
+    const totalDraws = result.total;
+    const rateCounts = result.rate_counts || {};
+
     if (completed) {
       await supabaseRequest("gacha_winners", {
         method: "POST",
         body: JSON.stringify({
-          draws: newTotal
+          draws: totalDraws
         })
       });
     }
 
     res.json({
       item,
-      totalDraws: newTotal,
+      totalDraws,
       rateCounts,
       completed
     });
 
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       error: "ガチャ処理に失敗しました"
     });
   }
 });
 
-/* 殿堂入り一覧 */
 async function getWinners(res) {
   try {
     const winners = await supabaseRequest(
@@ -190,18 +176,17 @@ async function getWinners(res) {
     res.json(records);
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       error: "殿堂入り記録の取得に失敗しました"
     });
   }
 }
 
-/* 現在のフロント用 */
 app.get("/api/winners", async (req, res) => {
   await getWinners(res);
 });
 
-/* 以前のフロントにも対応 */
 app.get("/api/records", async (req, res) => {
   await getWinners(res);
 });
