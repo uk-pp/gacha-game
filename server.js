@@ -1,10 +1,10 @@
 const express = require("express");
-const path = require("path");
-const fs = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(__dirname, "data.json");
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 
 const ITEMS = [
   { id: "target", name: "0.0001%", rate: 0.0001, target: true },
@@ -13,38 +13,37 @@ const ITEMS = [
   { id: "normal", name: "85%", rate: 85, target: false }
 ];
 
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return {};
+app.use(express.json());
 
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  } catch {
-    return {};
-  }
-}
+/* Renderのプロキシ越しでもIPを取得 */
+app.set("trust proxy", 1);
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
+/* GitHubではファイルを全部ルートに置いている */
+app.use(express.static(__dirname));
 
 function getIp(req) {
   return req.ip || req.socket.remoteAddress || "unknown";
 }
 
-function getPlayer(data, ip) {
-  if (!data[ip]) {
-    data[ip] = {
-      total: 0,
-      rateCounts: {},
-      completed: false
-    };
+async function supabaseRequest(path, options = {}) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      "apikey": SUPABASE_SECRET_KEY,
+      "Authorization": `Bearer ${SUPABASE_SECRET_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": "return=representation",
+      ...(options.headers || {})
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Supabase error: ${response.status} ${text}`);
   }
 
-  if (!data[ip].rateCounts) data[ip].rateCounts = {};
-  if (typeof data[ip].total !== "number") data[ip].total = 0;
-  if (typeof data[ip].completed !== "boolean") data[ip].completed = false;
-
-  return data[ip];
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
 }
 
 function drawItem() {
@@ -62,71 +61,149 @@ function drawItem() {
   return ITEMS[ITEMS.length - 1];
 }
 
-app.use(express.json());
+/* プレイヤー取得 */
+async function getPlayer(ip) {
+  const rows = await supabaseRequest(
+    `gacha_players?ip=eq.${encodeURIComponent(ip)}&limit=1`
+  );
 
-/* GitHubではファイルを全部ルートに置いているので、ここを__dirnameにする */
-app.use(express.static(__dirname));
+  if (rows.length > 0) {
+    const player = rows[0];
 
-app.get("/api/status", (req, res) => {
-  const data = loadData();
-  const player = getPlayer(data, getIp(req));
+    if (!player.rate_counts) player.rate_counts = {};
+    if (typeof player.total !== "number") player.total = 0;
+    if (typeof player.completed !== "boolean") player.completed = false;
 
-  res.json({
-    totalDraws: player.total,
-    rateCounts: player.rateCounts,
-    completed: player.completed
-  });
-});
-
-app.post("/api/draw", (req, res) => {
-  const data = loadData();
-  const ip = getIp(req);
-  const player = getPlayer(data, ip);
-
-  /* 0.0001%を引いた後はもう引けない */
-  if (player.completed) {
-    return res.json({
-      completed: true,
-      totalDraws: player.total,
-      rateCounts: player.rateCounts
-    });
+    return player;
   }
 
-  const item = drawItem();
+  const newPlayer = {
+    ip,
+    total: 0,
+    rate_counts: {},
+    completed: false
+  };
 
-  player.total++;
+  const created = await supabaseRequest("gacha_players", {
+    method: "POST",
+    body: JSON.stringify(newPlayer)
+  });
 
-  const key = String(item.rate);
-  player.rateCounts[key] = (player.rateCounts[key] || 0) + 1;
+  return created[0];
+}
 
-  if (item.target === true) {
-    player.completed = true;
+/* 現在の状態 */
+app.get("/api/status", async (req, res) => {
+  try {
+    const player = await getPlayer(getIp(req));
 
-    if (!data._winners) {
-      data._winners = [];
+    res.json({
+      totalDraws: player.total,
+      rateCounts: player.rate_counts,
+      completed: player.completed
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "データ取得に失敗しました" });
+  }
+});
+
+/* ガチャ */
+app.post("/api/draw", async (req, res) => {
+  try {
+    const ip = getIp(req);
+    const player = await getPlayer(ip);
+
+    /* 0.0001%達成後はもう引けない */
+    if (player.completed) {
+      return res.json({
+        completed: true,
+        totalDraws: player.total,
+        rateCounts: player.rate_counts
+      });
     }
 
-    data._winners.push({
-      number: data._winners.length + 1,
-      draws: player.total,
-      date: new Date().toISOString()
+    const item = drawItem();
+
+    const newTotal = player.total + 1;
+
+    const rateCounts = {
+      ...(player.rate_counts || {})
+    };
+
+    const key = String(item.rate);
+    rateCounts[key] = (rateCounts[key] || 0) + 1;
+
+    const completed = item.target === true;
+
+    /* プレイヤー情報を更新 */
+    await supabaseRequest(
+      `gacha_players?ip=eq.${encodeURIComponent(ip)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          total: newTotal,
+          rate_counts: rateCounts,
+          completed
+        })
+      }
+    );
+
+    /* 0.0001%達成者を記録 */
+    if (completed) {
+      await supabaseRequest("gacha_winners", {
+        method: "POST",
+        body: JSON.stringify({
+          draws: newTotal
+        })
+      });
+    }
+
+    res.json({
+      item,
+      totalDraws: newTotal,
+      rateCounts,
+      completed
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "ガチャ処理に失敗しました"
     });
   }
-
-  saveData(data);
-
-  res.json({
-    item,
-    totalDraws: player.total,
-    rateCounts: player.rateCounts,
-    completed: player.completed
-  });
 });
 
-app.get("/api/winners", (req, res) => {
-  const data = loadData();
+/* 殿堂入り一覧 */
+async function getWinners(res) {
+  try {
+    const winners = await supabaseRequest(
+      "gacha_winners?select=id,draws,created_at&order=id.asc"
+    );
 
-  res.json(data._winners || []);
+    const records = winners.map((winner, index) => ({
+      number: index + 1,
+      draws: winner.draws,
+      date: winner.created_at
+    }));
+
+    res.json(records);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "殿堂入り記録の取得に失敗しました"
+    });
+  }
+}
+
+/* 現在のフロント用 */
+app.get("/api/winners", async (req, res) => {
+  await getWinners(res);
+});
+
+/* 以前のフロントにも対応 */
+app.get("/api/records", async (req, res) => {
+  await getWinners(res);
 });
 
 app.listen(PORT, () => {
