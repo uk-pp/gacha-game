@@ -1,4 +1,5 @@
 const express = require("express");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,11 +15,25 @@ const ITEMS = [
 ];
 
 app.use(express.json());
-app.set("trust proxy", 1);
 app.use(express.static(__dirname));
 
-function getIp(req) {
-  return req.ip || req.socket.remoteAddress || "unknown";
+function getPlayerId(req, res) {
+  const cookies = req.headers.cookie || "";
+
+  const match = cookies.match(/gacha_player_id=([^;]+)/);
+
+  if (match) {
+    return decodeURIComponent(match[1]);
+  }
+
+  const playerId = crypto.randomUUID();
+
+  res.setHeader(
+    "Set-Cookie",
+    `gacha_player_id=${encodeURIComponent(playerId)}; Path=/; Max-Age=31536000; SameSite=Lax`
+  );
+
+  return playerId;
 }
 
 async function supabaseRequest(path, options = {}) {
@@ -57,9 +72,9 @@ function drawItem() {
   return ITEMS[ITEMS.length - 1];
 }
 
-async function getPlayer(ip) {
+async function getPlayer(playerId) {
   const rows = await supabaseRequest(
-    `gacha_players?ip=eq.${encodeURIComponent(ip)}&limit=1`
+    `gacha_players?ip=eq.${encodeURIComponent(playerId)}&limit=1`
   );
 
   if (rows.length > 0) {
@@ -67,7 +82,7 @@ async function getPlayer(ip) {
   }
 
   const newPlayer = {
-    ip,
+    ip: playerId,
     total: 0,
     rate_counts: {},
     completed: false
@@ -81,9 +96,11 @@ async function getPlayer(ip) {
   return created[0];
 }
 
+/* 現在の状態 */
 app.get("/api/status", async (req, res) => {
   try {
-    const player = await getPlayer(getIp(req));
+    const playerId = getPlayerId(req, res);
+    const player = await getPlayer(playerId);
 
     res.json({
       totalDraws: player.total,
@@ -92,23 +109,21 @@ app.get("/api/status", async (req, res) => {
     });
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       error: "データ取得に失敗しました"
     });
   }
 });
 
+/* ガチャ */
 app.post("/api/draw", async (req, res) => {
   try {
-    const ip = getIp(req);
+    const playerId = getPlayerId(req, res);
 
-    /*
-      DB側の関数で「1回引く＝必ず1回加算」を行う。
-      同時に複数回リクエストされても累計が戻らない。
-    */
+    const player = await getPlayer(playerId);
 
-    const player = await getPlayer(ip);
-
+    /* クリア済みなら引けない */
     if (player.completed) {
       return res.json({
         completed: true,
@@ -121,12 +136,15 @@ app.post("/api/draw", async (req, res) => {
     const key = String(item.rate);
     const completed = item.target === true;
 
+    /*
+      DB側の関数で累計を安全に+1する
+    */
     const result = await supabaseRequest(
       "rpc/increment_gacha_player",
       {
         method: "POST",
         body: JSON.stringify({
-          p_ip: ip,
+          p_ip: playerId,
           p_rate: key,
           p_completed: completed
         })
@@ -161,6 +179,7 @@ app.post("/api/draw", async (req, res) => {
   }
 });
 
+/* 殿堂入り */
 async function getWinners(res) {
   try {
     const winners = await supabaseRequest(
